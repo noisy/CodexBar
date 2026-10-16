@@ -6,10 +6,18 @@ struct GrokFailedBillingWorkTests {
     enum Scenario: String, CaseIterable, Sendable {
         case personalUnavailable, teamUnauthorized, initializationFailure, expiredTeam, teamFallback, billingSuccess
         case expiresDuringScan, expiresDuringVersion, acceptedIdentity
-        case methodUnavailableAlternateMessage, methodMessageWrongCode
+        case methodUnavailableAlternateMessage, methodMessageWrongCode, legacyBillingSuccess
+
+        var hasBilling: Bool {
+            self == .billingSuccess || self == .legacyBillingSuccess
+        }
+
+        var retriesBilling: Bool {
+            self != .initializationFailure && self != .billingSuccess && self.errorCode == -32601
+        }
 
         var acceptsSnapshot: Bool {
-            self == .teamFallback || self == .billingSuccess || self == .acceptedIdentity
+            self == .teamFallback || self.hasBilling || self == .acceptedIdentity
                 || self == .methodUnavailableAlternateMessage
         }
 
@@ -40,7 +48,7 @@ struct GrokFailedBillingWorkTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("grok-work-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        if scenario != .personalUnavailable, scenario != .billingSuccess {
+        if scenario != .personalUnavailable, !scenario.hasBilling {
             let auth = try JSONSerialization.data(withJSONObject: [
                 "https://auth.x.ai::fake-client": [
                     "key": "synthetic-token", "refresh_token": "synthetic-refresh",
@@ -69,6 +77,10 @@ struct GrokFailedBillingWorkTests {
             id: 2,
             result: ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]],
             error: scenario == .billingSuccess ? nil : scenario.errorMessage)
+        let legacyBilling = try reply(
+            id: 3,
+            result: ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]],
+            error: scenario == .legacyBillingSuccess ? nil : scenario.errorMessage)
         let script = """
         #!/bin/sh
         if [ "$1" = "--version" ]; then
@@ -79,7 +91,11 @@ struct GrokFailedBillingWorkTests {
         IFS= read -r initialize_request
         printf '%s\\n' '\(initialize)'
         IFS= read -r billing_request || exit 0
+        printf '%s\\n' "$billing_request" >> "$GROK_HOME/billing-requests.jsonl"
         printf '%s\\n' '\(billing)'
+        IFS= read -r legacy_billing_request || exit 0
+        printf '%s\\n' "$legacy_billing_request" >> "$GROK_HOME/billing-requests.jsonl"
+        printf '%s\\n' '\(legacyBilling)'
         """
         try script.write(to: binary, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
@@ -131,7 +147,7 @@ struct GrokFailedBillingWorkTests {
             #expect(snapshot.localSummary?.daily == summary.daily)
             #expect(snapshot.toUsageSnapshot().costUsage?.last30DaysTokens == 42)
             #expect(snapshot.cliVersion == "synthetic-version")
-            if scenario != .billingSuccess {
+            if !scenario.hasBilling {
                 #expect(snapshot.billing == nil)
                 #expect(snapshot.credentials?.email == "team@example.com")
                 #expect(snapshot.diagnostic == GrokStatusProbe.teamUsageUnavailableMessage)
@@ -147,6 +163,16 @@ struct GrokFailedBillingWorkTests {
             }
             #expect(message == scenario.errorMessage)
             #expect(code == scenario.errorCode)
+        }
+        if scenario != .initializationFailure {
+            let requests = try String(
+                contentsOf: root.appendingPathComponent("billing-requests.jsonl"), encoding: .utf8)
+            let methods = try requests.split(separator: "\n").map { line in
+                let request = try #require(
+                    JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+                return try #require(request["method"] as? String)
+            }
+            #expect(methods == (scenario.retriesBilling ? ["_x.ai/billing", "x.ai/billing"] : ["_x.ai/billing"]))
         }
         #expect(await calls.scans == (scenario.scansBeforeResult ? 1 : 0))
         #expect(await calls

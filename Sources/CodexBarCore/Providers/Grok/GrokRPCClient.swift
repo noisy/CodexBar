@@ -4,7 +4,7 @@ import Foundation
 ///
 /// The protocol mirrors Codex's app-server (newline-delimited JSON-RPC 2.0 over stdin/stdout),
 /// but uses `protocolVersion`/`clientCapabilities` for the `initialize` call instead of
-/// `clientInfo`. Billing is fetched via the `x.ai/billing` extension method.
+/// `clientInfo`. Billing uses `_x.ai/billing`, with `x.ai/billing` as a legacy fallback.
 final class GrokRPCClient: @unchecked Sendable {
     private static let log = CodexBarLog.logger(LogCategories.provider(.grok))
 
@@ -77,9 +77,15 @@ final class GrokRPCClient: @unchecked Sendable {
             timeout: self.initializeTimeoutSeconds)
     }
 
-    /// Calls `x.ai/billing` and returns the decoded response.
+    /// Calls `_x.ai/billing`, retrying legacy `x.ai/billing` only when the method is unavailable.
     func fetchBilling() async throws -> GrokBillingResponse {
-        let message = try await self.request(method: "x.ai/billing", params: [:])
+        let message: [String: Any]
+        do {
+            message = try await self.request(method: "_x.ai/billing", params: [:])
+        } catch {
+            guard GrokStatusProbe.isBillingMethodUnavailable(error) else { throw error }
+            message = try await self.request(method: "x.ai/billing", params: [:])
+        }
         return try self.decodeResult(from: message)
     }
 
@@ -150,11 +156,9 @@ final class GrokRPCClient: @unchecked Sendable {
 
     private func sendPayload(_ payload: [String: Any]) throws {
         let raw = try JSONSerialization.data(withJSONObject: payload)
-        // Foundation's JSONSerialization escapes "/" as "\/" by default. Grok's
-        // ACP server treats the escaped form as a *different* method name (it does
-        // not unescape before lookup), so `x.ai/billing` becomes "Method not found"
-        // when sent as `x.ai\/billing`. Re-encode without slash escapes to match
-        // the on-the-wire shape the grok agent expects.
+        // Foundation's JSONSerialization escapes "/" as "\/" by default. Keep
+        // `_x.ai/billing` and legacy `x.ai/billing` unescaped on the wire for
+        // compatibility with Grok ACP servers that look up method names literally.
         let unescaped = String(data: raw, encoding: .utf8)?
             .replacingOccurrences(of: "\\/", with: "/")
         var data = unescaped.flatMap { $0.data(using: .utf8) } ?? raw
@@ -232,7 +236,7 @@ public enum GrokRPCError: LocalizedError, Sendable {
     }
 }
 
-/// Schema for the `x.ai/billing` result.
+/// Schema for the `_x.ai/billing` result (also used by legacy `x.ai/billing`).
 ///
 /// All monetary amounts (`monthlyLimit`, `onDemandCap`, `includedUsed`, etc.) are
 /// represented as `{ val: <cents> }` in the wire format.
