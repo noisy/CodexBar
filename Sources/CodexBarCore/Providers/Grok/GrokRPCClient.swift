@@ -78,7 +78,7 @@ final class GrokRPCClient: @unchecked Sendable {
     }
 
     /// Calls `_x.ai/billing`, retrying legacy `x.ai/billing` only when the method is unavailable.
-    func fetchBilling() async throws -> GrokBillingResponse {
+    func fetchBilling() async throws -> GrokRPCBilling {
         let message: [String: Any]
         do {
             message = try await self.request(method: "_x.ai/billing", params: [:])
@@ -186,13 +186,20 @@ final class GrokRPCClient: @unchecked Sendable {
         throw GrokRPCError.malformed("grok agent stdio closed stdout")
     }
 
-    private func decodeResult<T: Decodable>(from message: [String: Any]) throws -> T {
+    private func decodeResult(from message: [String: Any]) throws -> GrokRPCBilling {
         guard let result = message["result"] else {
             throw GrokRPCError.malformed("missing result field")
         }
         let data = try JSONSerialization.data(withJSONObject: result)
-        let decoder = JSONDecoder()
-        return try decoder.decode(T.self, from: data)
+        if let credits = try? GrokCreditsProxyFetcher.parseSnapshot(data), credits.usedPercent != nil {
+            return .credits(credits)
+        }
+        if let billing = try? JSONDecoder().decode(GrokBillingResponse.self, from: data),
+           billing.monthlyUsedPercent != nil
+        {
+            return .legacy(billing)
+        }
+        throw GrokRPCError.malformed("billing result did not report a usage percentage")
     }
 
     private func jsonID(_ value: Any?) -> Int? {
@@ -202,6 +209,11 @@ final class GrokRPCClient: @unchecked Sendable {
         default: nil
         }
     }
+}
+
+enum GrokRPCBilling: Sendable {
+    case credits(GrokWebBillingSnapshot)
+    case legacy(GrokBillingResponse)
 }
 
 public enum GrokRPCError: LocalizedError, Sendable {
@@ -236,7 +248,7 @@ public enum GrokRPCError: LocalizedError, Sendable {
     }
 }
 
-/// Schema for the `_x.ai/billing` result (also used by legacy `x.ai/billing`).
+/// Legacy top-level billing schema; current `_x.ai/billing` results use the nested credits parser.
 ///
 /// All monetary amounts (`monthlyLimit`, `onDemandCap`, `includedUsed`, etc.) are
 /// represented as `{ val: <cents> }` in the wire format.

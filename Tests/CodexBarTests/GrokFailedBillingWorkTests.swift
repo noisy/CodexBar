@@ -7,13 +7,22 @@ struct GrokFailedBillingWorkTests {
         case personalUnavailable, teamUnauthorized, initializationFailure, expiredTeam, teamFallback, billingSuccess
         case expiresDuringScan, expiresDuringVersion, acceptedIdentity
         case methodUnavailableAlternateMessage, methodMessageWrongCode, legacyBillingSuccess
+        case nestedBillingSuccess, nestedBillingPeriodFallback, unknownBillingResult
+
+        var hasCredits: Bool {
+            self == .nestedBillingSuccess || self == .nestedBillingPeriodFallback
+        }
 
         var hasBilling: Bool {
-            self == .billingSuccess || self == .legacyBillingSuccess
+            self == .billingSuccess || self == .legacyBillingSuccess || self.hasCredits
+        }
+
+        var returnsBillingResult: Bool {
+            self == .billingSuccess || self.hasCredits || self == .unknownBillingResult
         }
 
         var retriesBilling: Bool {
-            self != .initializationFailure && self != .billingSuccess && self.errorCode == -32601
+            self != .initializationFailure && !self.returnsBillingResult && self.errorCode == -32601
         }
 
         var acceptsSnapshot: Bool {
@@ -73,10 +82,30 @@ struct GrokFailedBillingWorkTests {
         }
         let initialize = try reply(
             id: 1, result: [:], error: scenario == .initializationFailure ? scenario.errorMessage : nil)
+        let billingResult: [String: Any]
+        if scenario.hasCredits {
+            var config: [String: Any] = [
+                "creditUsagePercent": 5.0,
+                "billingPeriodEnd": "2026-10-22T17:24:18.000000+00:00",
+            ]
+            if scenario == .nestedBillingSuccess {
+                config["currentPeriod"] = [
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-10-15T17:24:18.000000+00:00",
+                    "end": "2026-10-22T17:24:18.000000+00:00",
+                ]
+                config["billingPeriodEnd"] = "2026-11-15T17:24:18Z"
+            }
+            billingResult = ["config": config, "subscription_tier": "SuperGrok"]
+        } else if scenario == .unknownBillingResult {
+            billingResult = ["subscription_tier": "SuperGrok", "config": [:]]
+        } else {
+            billingResult = ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]]
+        }
         let billing = try reply(
             id: 2,
-            result: ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]],
-            error: scenario == .billingSuccess ? nil : scenario.errorMessage)
+            result: billingResult,
+            error: scenario.returnsBillingResult ? nil : scenario.errorMessage)
         let legacyBilling = try reply(
             id: 3,
             result: ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]],
@@ -151,18 +180,30 @@ struct GrokFailedBillingWorkTests {
                 #expect(snapshot.billing == nil)
                 #expect(snapshot.credentials?.email == "team@example.com")
                 #expect(snapshot.diagnostic == GrokStatusProbe.teamUsageUnavailableMessage)
+            } else if scenario.hasCredits {
+                let primary = try #require(snapshot.toUsageSnapshot().primary)
+                #expect(primary.usedPercent == 5)
+                #expect(primary.resetsAt == ISO8601DateParser.parse("2026-10-22T17:24:18Z"))
+                #expect(snapshot.diagnostic == nil)
             } else {
                 #expect(snapshot.billing?.monthlyUsedPercent == 25)
                 #expect(snapshot.diagnostic == nil)
             }
         } catch let error as GrokRPCError {
             #expect(!scenario.acceptsSnapshot)
-            guard case let .requestFailed(message, code) = error else {
-                Issue.record("Unexpected RPC error: \(error)")
-                return
+            if scenario == .unknownBillingResult {
+                guard case .malformed = error else {
+                    Issue.record("Expected malformed billing error: \(error)")
+                    return
+                }
+            } else {
+                guard case let .requestFailed(message, code) = error else {
+                    Issue.record("Unexpected RPC error: \(error)")
+                    return
+                }
+                #expect(message == scenario.errorMessage)
+                #expect(code == scenario.errorCode)
             }
-            #expect(message == scenario.errorMessage)
-            #expect(code == scenario.errorCode)
         }
         if scenario != .initializationFailure {
             let requests = try String(
