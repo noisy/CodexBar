@@ -4,7 +4,7 @@ import Foundation
 ///
 /// The protocol mirrors Codex's app-server (newline-delimited JSON-RPC 2.0 over stdin/stdout),
 /// but uses `protocolVersion`/`clientCapabilities` for the `initialize` call instead of
-/// `clientInfo`. Billing uses `_x.ai/billing`, with `x.ai/billing` as a legacy fallback.
+/// `clientInfo`. Billing uses the `_x.ai/billing` ACP extension method.
 final class GrokRPCClient: @unchecked Sendable {
     private static let log = CodexBarLog.logger(LogCategories.provider(.grok))
 
@@ -77,16 +77,24 @@ final class GrokRPCClient: @unchecked Sendable {
             timeout: self.initializeTimeoutSeconds)
     }
 
-    /// Calls `_x.ai/billing`, retrying legacy `x.ai/billing` only when the method is unavailable.
+    /// Calls the ACP billing extension and decodes current or legacy response payloads.
     func fetchBilling() async throws -> GrokRPCBilling {
-        let message: [String: Any]
-        do {
-            message = try await self.request(method: "_x.ai/billing", params: [:])
-        } catch {
-            guard GrokStatusProbe.isBillingMethodUnavailable(error) else { throw error }
-            message = try await self.request(method: "x.ai/billing", params: [:])
+        let message = try await self.request(method: "_x.ai/billing", params: [:])
+        guard let result = message["result"] as? [String: Any] else {
+            throw GrokRPCError.malformed("missing result field")
         }
-        return try self.decodeResult(from: message)
+        let data = try JSONSerialization.data(withJSONObject: result)
+        if let credits = try? GrokCreditsProxyFetcher.parseSnapshot(data),
+           credits.usedPercent != nil || credits.prepaidBalanceUSD != nil
+        {
+            return .credits(credits.applying(subscriptionTier: result["subscription_tier"] as? String))
+        }
+        if let billing = try? JSONDecoder().decode(GrokBillingResponse.self, from: data),
+           billing.monthlyUsedPercent != nil
+        {
+            return .legacy(billing)
+        }
+        throw GrokRPCError.malformed(GrokStatusProbe.usageUnavailableMessage)
     }
 
     func shutdown() {
@@ -107,7 +115,12 @@ final class GrokRPCClient: @unchecked Sendable {
     {
         let id = self.nextID
         self.nextID += 1
-        try self.sendRequest(id: id, method: method, params: params)
+        try self.sendPayload([
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params ?? [:],
+        ])
 
         let resolvedTimeout = timeout ?? self.requestTimeoutSeconds
         let wrapped = try await RPCRequestTimeout.run(
@@ -143,25 +156,8 @@ final class GrokRPCClient: @unchecked Sendable {
         }
     }
 
-    private func sendRequest(id: Int, method: String, params: [String: Any]?) throws {
-        let paramsValue: Any = params ?? [:]
-        let payload: [String: Any] = [
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": paramsValue,
-        ]
-        try self.sendPayload(payload)
-    }
-
     private func sendPayload(_ payload: [String: Any]) throws {
-        let raw = try JSONSerialization.data(withJSONObject: payload)
-        // Foundation's JSONSerialization escapes "/" as "\/" by default. Keep
-        // `_x.ai/billing` and legacy `x.ai/billing` unescaped on the wire for
-        // compatibility with Grok ACP servers that look up method names literally.
-        let unescaped = String(data: raw, encoding: .utf8)?
-            .replacingOccurrences(of: "\\/", with: "/")
-        var data = unescaped.flatMap { $0.data(using: .utf8) } ?? raw
+        var data = try JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes])
         if let preview = String(data: data.prefix(200), encoding: .utf8) {
             Self.log.debug("grok rpc -> \(preview)")
         }
@@ -186,28 +182,8 @@ final class GrokRPCClient: @unchecked Sendable {
         throw GrokRPCError.malformed("grok agent stdio closed stdout")
     }
 
-    private func decodeResult(from message: [String: Any]) throws -> GrokRPCBilling {
-        guard let result = message["result"] else {
-            throw GrokRPCError.malformed("missing result field")
-        }
-        let data = try JSONSerialization.data(withJSONObject: result)
-        if let credits = try? GrokCreditsProxyFetcher.parseSnapshot(data), credits.usedPercent != nil {
-            return .credits(credits)
-        }
-        if let billing = try? JSONDecoder().decode(GrokBillingResponse.self, from: data),
-           billing.monthlyUsedPercent != nil
-        {
-            return .legacy(billing)
-        }
-        throw GrokRPCError.malformed("billing result did not report a usage percentage")
-    }
-
     private func jsonID(_ value: Any?) -> Int? {
-        switch value {
-        case let int as Int: int
-        case let number as NSNumber: number.intValue
-        default: nil
-        }
+        (value as? NSNumber)?.intValue
     }
 }
 

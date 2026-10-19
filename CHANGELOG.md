@@ -2,6 +2,10 @@
 
 ## 0.77.1 — Unreleased
 
+### Fixed
+
+- Grok: restore CLI billing through the ACP extension method, including current usage, reset, plan, and prepaid balance fields (#4595). Thanks @noisy!
+
 ## 0.77.0 — 2026-10-16
 
 ### Highlights

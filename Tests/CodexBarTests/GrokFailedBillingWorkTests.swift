@@ -6,23 +6,19 @@ struct GrokFailedBillingWorkTests {
     enum Scenario: String, CaseIterable, Sendable {
         case personalUnavailable, teamUnauthorized, initializationFailure, expiredTeam, teamFallback, billingSuccess
         case expiresDuringScan, expiresDuringVersion, acceptedIdentity
-        case methodUnavailableAlternateMessage, methodMessageWrongCode, legacyBillingSuccess
-        case nestedBillingSuccess, nestedBillingPeriodFallback, unknownBillingResult
+        case methodUnavailableAlternateMessage, methodMessageWrongCode
+        case nestedBillingSuccess, nestedBillingPeriodFallback, prepaidOnlyBillingSuccess, unknownBillingResult
 
         var hasCredits: Bool {
-            self == .nestedBillingSuccess || self == .nestedBillingPeriodFallback
+            self == .nestedBillingSuccess || self == .nestedBillingPeriodFallback || self == .prepaidOnlyBillingSuccess
         }
 
         var hasBilling: Bool {
-            self == .billingSuccess || self == .legacyBillingSuccess || self.hasCredits
+            self == .billingSuccess || self.hasCredits
         }
 
         var returnsBillingResult: Bool {
             self == .billingSuccess || self.hasCredits || self == .unknownBillingResult
-        }
-
-        var retriesBilling: Bool {
-            self != .initializationFailure && !self.returnsBillingResult && self.errorCode == -32601
         }
 
         var acceptsSnapshot: Bool {
@@ -38,8 +34,32 @@ struct GrokFailedBillingWorkTests {
             switch self {
             case .teamUnauthorized: "Unauthorized"
             case .initializationFailure: "Initialize failed"
-            case .methodUnavailableAlternateMessage: "Unsupported RPC method: x.ai/billing"
+            case .methodUnavailableAlternateMessage: "Unsupported RPC method: _x.ai/billing"
             default: "Method not found"
+            }
+        }
+
+        var billingResult: [String: Any] {
+            if self.hasCredits {
+                var config: [String: Any] = [
+                    "creditUsagePercent": 5.0,
+                    "billingPeriodEnd": "2026-10-22T17:24:18.000000+00:00",
+                ]
+                if self == .nestedBillingSuccess {
+                    config["currentPeriod"] = [
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-10-15T17:24:18.000000+00:00",
+                        "end": "2026-10-22T17:24:18.000000+00:00",
+                    ]
+                    config["billingPeriodEnd"] = "2026-11-15T17:24:18Z"
+                } else if self == .prepaidOnlyBillingSuccess {
+                    config = ["prepaidBalance": ["val": 123]]
+                }
+                return ["config": config, "subscription_tier": "SuperGrok Heavy"]
+            } else if self == .unknownBillingResult {
+                return ["subscription_tier": "SuperGrok", "config": [:]]
+            } else {
+                return ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]]
             }
         }
 
@@ -82,34 +102,10 @@ struct GrokFailedBillingWorkTests {
         }
         let initialize = try reply(
             id: 1, result: [:], error: scenario == .initializationFailure ? scenario.errorMessage : nil)
-        let billingResult: [String: Any]
-        if scenario.hasCredits {
-            var config: [String: Any] = [
-                "creditUsagePercent": 5.0,
-                "billingPeriodEnd": "2026-10-22T17:24:18.000000+00:00",
-            ]
-            if scenario == .nestedBillingSuccess {
-                config["currentPeriod"] = [
-                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                    "start": "2026-10-15T17:24:18.000000+00:00",
-                    "end": "2026-10-22T17:24:18.000000+00:00",
-                ]
-                config["billingPeriodEnd"] = "2026-11-15T17:24:18Z"
-            }
-            billingResult = ["config": config, "subscription_tier": "SuperGrok"]
-        } else if scenario == .unknownBillingResult {
-            billingResult = ["subscription_tier": "SuperGrok", "config": [:]]
-        } else {
-            billingResult = ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]]
-        }
         let billing = try reply(
             id: 2,
-            result: billingResult,
+            result: scenario.billingResult,
             error: scenario.returnsBillingResult ? nil : scenario.errorMessage)
-        let legacyBilling = try reply(
-            id: 3,
-            result: ["monthlyLimit": ["val": 100], "usage": ["totalUsed": ["val": 25]]],
-            error: scenario == .legacyBillingSuccess ? nil : scenario.errorMessage)
         let script = """
         #!/bin/sh
         if [ "$1" = "--version" ]; then
@@ -122,9 +118,6 @@ struct GrokFailedBillingWorkTests {
         IFS= read -r billing_request || exit 0
         printf '%s\\n' "$billing_request" >> "$GROK_HOME/billing-requests.jsonl"
         printf '%s\\n' '\(billing)'
-        IFS= read -r legacy_billing_request || exit 0
-        printf '%s\\n' "$legacy_billing_request" >> "$GROK_HOME/billing-requests.jsonl"
-        printf '%s\\n' '\(legacyBilling)'
         """
         try script.write(to: binary, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
@@ -181,9 +174,16 @@ struct GrokFailedBillingWorkTests {
                 #expect(snapshot.credentials?.email == "team@example.com")
                 #expect(snapshot.diagnostic == GrokStatusProbe.teamUsageUnavailableMessage)
             } else if scenario.hasCredits {
-                let primary = try #require(snapshot.toUsageSnapshot().primary)
-                #expect(primary.usedPercent == 5)
-                #expect(primary.resetsAt == ISO8601DateParser.parse("2026-10-22T17:24:18Z"))
+                let usage = snapshot.toUsageSnapshot()
+                if scenario == .prepaidOnlyBillingSuccess {
+                    #expect(usage.primary == nil)
+                    #expect(usage.providerCost?.balance == 1.23)
+                } else {
+                    let primary = try #require(usage.primary)
+                    #expect(primary.usedPercent == 5)
+                    #expect(primary.resetsAt == ISO8601DateParser.parse("2026-10-22T17:24:18Z"))
+                }
+                #expect(usage.identity?.loginMethod == "SuperGrok Heavy")
                 #expect(snapshot.diagnostic == nil)
             } else {
                 #expect(snapshot.billing?.monthlyUsedPercent == 25)
@@ -213,7 +213,7 @@ struct GrokFailedBillingWorkTests {
                     JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
                 return try #require(request["method"] as? String)
             }
-            #expect(methods == (scenario.retriesBilling ? ["_x.ai/billing", "x.ai/billing"] : ["_x.ai/billing"]))
+            #expect(methods == ["_x.ai/billing"])
         }
         #expect(await calls.scans == (scenario.scansBeforeResult ? 1 : 0))
         #expect(await calls
